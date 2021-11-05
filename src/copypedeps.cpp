@@ -17,6 +17,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 *****************************************************************************/
 
+#define _CRT_INTERNAL_NONSTDC_NAMES 1
+
 #include "pestructs.h"
 #include "pedeps.h"
 #include "pedeps_version.h"
@@ -27,26 +29,57 @@ THE SOFTWARE.
 #include <inttypes.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <unistd.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <shlwapi.h>
+#include <io.h>
 #else
 #include <utime.h>
+#include <unistd.h>
 #endif
-#include <avl.h>
+
+#include <set>
+#include <string>
+
+#if !defined(S_ISREG) && defined(S_IFMT) && defined(S_IFREG)
+  #define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
+#endif
+#if !defined(S_ISDIR) && defined(S_IFMT) && defined(S_IFDIR)
+  #define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+#endif
+
+#ifndef S_IRUSR
+#define S_IRUSR 0
+#endif
+#ifndef S_IWUSR
+#define S_IWUSR 0
+#endif
+#ifndef S_IRGRP
+#define S_IRGRP 0
+#endif
+#ifndef S_IWGRP
+#define S_IWGRP 0
+#endif
+#ifndef S_IROTH
+#define S_IROTH 0
+#endif
+#ifndef S_IWOTH
+#define S_IWOTH 0
+#endif
 
 #ifdef _WIN32
 #define realpath(N,R) _fullpath((R),(N),_MAX_PATH)
 #if defined(_WIN32) && !defined(__MINGW64_VERSION_MAJOR)
 #define strcasecmp stricmp
 #define strncasecmp strnicmp
+typedef SSIZE_T ssize_t;
 #endif
 #define PATHCMP strcasecmp
 #define PATHNCMP strncasecmp
 #define PATHSEPARATOR '\\'
 #define ISPATHSEPARATOR(c) ((c) == '\\' || (c) == '/')
 #define PATHLISTSEPARATOR ';'
+#define PATH_MAX 65536
 #else
 #ifndef PATH_MAX
 #include <linux/limits.h>
@@ -132,7 +165,7 @@ int copy_file (const char* srcfile, const char* dstfile, int overwrite)
     return 1;
   }
   //open destination file
-  if ((dsthandle = open(dstfile, O_WRONLY | O_BINARY | O_CREAT | (overwrite ? O_TRUNC : O_EXCL), S_IWUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH)) == -1) {
+  if ((dsthandle = open(dstfile, O_WRONLY | O_BINARY | O_CREAT | (overwrite ? O_TRUNC : O_EXCL), S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH)) == -1) {
     close(srchandle);
     return 2;
   }
@@ -236,7 +269,8 @@ struct dependancy_info_struct {
   int recursive;
   int overwrite;
   int dryrun;
-  avl_tree_t* filelist;
+  std::set<std::string> *filelist;
+  const char* windir;
   char* preferredpath;
   struct string_list_struct* pathlist;
 };
@@ -310,8 +344,7 @@ int is_in_path (const char* path1, const char* path2)
 
 int iterate_path_add (const char* path, void* callbackdata)
 {
-  if (!is_in_path(path, getenv("windir")))
-    string_list_append((struct string_list_struct**)callbackdata, path);
+  string_list_append((struct string_list_struct**)callbackdata, path);
   return 0;
 }
 
@@ -360,9 +393,11 @@ int iterate_dependancies_add (const char* modulename, const char* functionname, 
     char* path;
     if ((path = search_path(depinfo->preferredpath, depinfo->pathlist, modulename)) != NULL) {
       //new module, recursively add dependancies if wanted
-      if (avl_insert(depinfo->filelist, path) != NULL) {
+      if (depinfo->filelist->insert(path).second) {
         if (depinfo->recursive) {
-          add_dependancies(depinfo, path);
+          if (!is_in_path(path, depinfo->windir)) {
+            add_dependancies(depinfo, path);
+          }
         }
       } else {
         //module already listed, no further action needed
@@ -423,7 +458,6 @@ int main (int argc, char* argv[])
   char* dst;
   size_t dstlen;
   struct dependancy_info_struct depinfo;
-  avl_tree_t* filelist;
   //show help page if no parameters were given or help was requested
   for (i = 1; i < argc; i++) {
     if (argv[i][0] == '-' && (argv[i][1] == 'h' || argv[i][1] == '?') && argv[i][2] == 0)
@@ -451,21 +485,23 @@ int main (int argc, char* argv[])
     fprintf(stderr, "Destination folder not found: %s\n", dst);
     return 2;
   }
-  //initialize sorted list (AVL tree)
-  if ((filelist = avl_alloc_tree((avl_compare_t)PATHCMP, free)) == NULL) {
-    fprintf(stderr, "Memory allocation error\n");
-    return 3;
-  }
   //initialize
   depinfo.recursive = 0;
   depinfo.overwrite = 1;
   depinfo.dryrun = 0;
-  depinfo.filelist = filelist;
+  depinfo.filelist = new std::set<std::string>();
   depinfo.preferredpath = NULL;
   depinfo.pathlist = NULL;
   //determine search path
+  std::string windir = getenv("windir");
+  depinfo.windir = windir.c_str();
+  std::string system32 = windir + "/System32";
+  std::string system32_downlevel = system32 + "/downlevel";
+  iterate_path_add(system32.c_str(), &depinfo.pathlist);
+  iterate_path_add(system32_downlevel.c_str(), &depinfo.pathlist);
   iterate_path_list(getenv("PATH"), 0, iterate_path_add, &depinfo.pathlist);
   //process all parameters and get dependancies of the requested files
+  std::set<std::string> filelist_argv;
   for (i = 1; i < argc - 1; i++) {
     if (argv[i][0] == '-' && argv[i][1] == 'r' && argv[i][2] == 0) {
       depinfo.recursive = 1;
@@ -478,7 +514,8 @@ int main (int argc, char* argv[])
         fprintf(stderr, "File not found: %s\n", argv[i]);
       } else {
         //add current file
-        avl_insert(filelist, strdup(argv[i]));
+        depinfo.filelist->insert(argv[i]);
+        filelist_argv.insert(argv[i]);
         //determine preferred path (same folder as current file)
         depinfo.preferredpath = get_base_path(argv[i]);
         //add dependancies
@@ -489,15 +526,24 @@ int main (int argc, char* argv[])
       }
     }
   }
+  for (auto it = filelist_argv.begin(); it != filelist_argv.end(); ++it) {
+    depinfo.filelist->erase(*it);
+  }
   //free search path
   string_list_free(&depinfo.pathlist);
   //copy dependancies
-  avl_node_t* entry;
   unsigned int entryindex = 0;
-  while ((entry = avl_at(filelist, entryindex)) != NULL) {
+  for (auto it = depinfo.filelist->begin(); it != depinfo.filelist->end(); ++it) {
+    const char* full_path = it->c_str();
     const char* filename;
     char* dstpath;
-    if ((filename = get_filename_from_path((const char*)entry->item)) != NULL) {
+    if (is_in_path(full_path, depinfo.windir)) {
+      continue;
+    }
+    if ((filename = get_filename_from_path(full_path)) != NULL) {
+      if (StrStrIA(filename, "api-ms-win") == filename) {
+        continue;
+      }
       if ((dstpath = (char*)malloc(dstlen + strlen(filename) + 1)) != NULL) {
         memcpy(dstpath, dst, dstlen);
         strcpy(dstpath + dstlen, filename);
@@ -505,10 +551,10 @@ int main (int argc, char* argv[])
           fprintf(stderr, "Not overwriting existing file: %s\n", dstpath);
         } else {
           if (depinfo.dryrun) {
-            printf("%s -> %s\n", (const char*)entry->item, dstpath);
+            printf("%s -> %s\n", full_path, dstpath);
           } else {
-            if (copy_file((const char*)entry->item, dstpath, depinfo.overwrite) != 0)
-              fprintf(stderr, "Error copying %s to %s\n", (const char*)entry->item, dstpath);
+            if (copy_file(full_path, dstpath, depinfo.overwrite) != 0)
+              fprintf(stderr, "Error copying %s to %s\n", full_path, dstpath);
           }
         }
         free(dstpath);
@@ -517,7 +563,7 @@ int main (int argc, char* argv[])
     entryindex++;
   }
   //clean up
-  avl_free_tree(filelist);
+  delete depinfo.filelist;
   free(dst);
   return 0;
 }

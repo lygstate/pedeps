@@ -1,0 +1,5 @@
+{
+    "C_Cpp.autoAddFileAssociations": false,
+    "cmake.generator": "Ninja",
+    "cmake.buildDirectory": "${workspaceFolder}/build/${buildKitTriple}-${buildType}"
+}
